@@ -1,0 +1,8 @@
+{
+  "appId": "com.ghostykether.walktracker",
+  "appName": "Walk Tracker",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  }
+}
