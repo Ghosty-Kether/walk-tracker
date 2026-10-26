@@ -288,7 +288,6 @@
 <!-- Toast -->
 <div id="toast"></div>
 
-<!-- Accuracy badge -->
 <!-- History panel -->
 <div id="history-panel">
   <div class="panel-header">
@@ -335,7 +334,10 @@
 const state = {
   status: 'idle',   // idle | active | paused
   watchId: null,
-  coords: [],       // [{lat, lng, ts}]
+  coords: [],       // [{lat, lng, ts, gap?}]  gap = first point after a pause
+  liveSegments: [], // route being drawn, as [[lat, lng], …] per segment
+  newSegment: false,// next accepted point starts a new segment (after resume)
+  lastSpeedTs: 0,   // when the speed readout was last refreshed
   startTs: null,
   pausedMs: 0,
   pauseStart: null,
@@ -368,6 +370,7 @@ function ensureRouteLine() {
 
 function clearRouteLine() {
   if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+  state.liveSegments = [];
 }
 
 function clearReviewLine() {
@@ -389,6 +392,8 @@ function updateUserMarker(lat, lng) {
 
 // ─────────────────────────── Geolocation ───────────────────────────
 const GEO_OPTIONS = { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 };
+const MAX_ACCURACY_M = 50;   // ignore fixes less accurate than this for route and distance
+const MIN_STEP_M = 2;        // ignore movement smaller than this (GPS jitter)
 
 function onPosition(pos) {
   const { latitude: lat, longitude: lng, accuracy, speed } = pos.coords;
@@ -402,35 +407,63 @@ function onPosition(pos) {
 
   if (state.status !== 'active') return;
 
-  // First point
-  if (!state.lastPos) {
-    state.lastPos = { lat, lng };
-    map.setView([lat, lng], 17, { animate: true });
-    state.centered = true;
-  } else {
-    const d = haversine(state.lastPos.lat, state.lastPos.lng, lat, lng);
-    if (d > 2) { // filter jitter < 2m
-      state.totalDist += d;
-      state.lastPos = { lat, lng };
-    }
+  // Weak fix: keep showing the marker, but don't let it distort the route or distance
+  if (accuracy > MAX_ACCURACY_M) return;
+
+  const now = Date.now();
+  const hasDeviceSpeed = speed != null && !Number.isNaN(speed);
+
+  // Prefer the device-reported speed (m/s → km/h)
+  if (hasDeviceSpeed) {
+    setSpeed(speed * 3.6);
+    state.lastSpeedTs = now;
   }
 
-  state.coords.push({ lat, lng, ts: Date.now() });
-  ensureRouteLine();
-  routeLine.addLatLng([lat, lng]);
+  let stepKph = null;
+  if (state.lastPos) {
+    const d = haversine(state.lastPos.lat, state.lastPos.lng, lat, lng);
+    if (d < MIN_STEP_M) return; // jitter, not recorded
+    state.totalDist += d;
+    const dt = (now - state.lastPos.ts) / 1000;
+    if (dt > 0) stepKph = (d / dt) * 3.6;
+  } else if (state.coords.length === 0) {
+    // first point of a new walk
+    map.setView([lat, lng], 17, { animate: true });
+    state.centered = true;
+  }
 
-  // current speed (m/s → km/h)
-  const kph = speed != null ? (speed * 3.6).toFixed(1) : null;
-  if (kph !== null) el('stat-speed').innerHTML = `${kph}<span class="stat-unit">km/h</span>`;
+  // Fallback speed when the device doesn't report one
+  if (stepKph !== null && !hasDeviceSpeed) {
+    setSpeed(stepKph);
+    state.lastSpeedTs = now;
+  }
+
+  const point = { lat, lng, ts: now };
+  // First point after a pause: start a new segment so no line is drawn across the gap
+  if (state.newSegment && state.coords.length) point.gap = true;
+  state.newSegment = false;
+
+  state.lastPos = { lat, lng, ts: now };
+  state.coords.push(point);
+  addRoutePoint(point);
+  schedulePersist();
 }
 
+let lastGeoToast = 0;
 function onGeoError(err) {
-  let msg = 'Location unavailable';
-  if (err.code === 1) msg = 'Location permission denied. Please allow location access and try again.';
-  else if (err.code === 2) msg = 'Location signal lost. Move to an open area.';
-  else if (err.code === 3) msg = 'Location request timed out.';
-  showToast(msg, 4000);
-  if (state.status === 'active') stopWalk();
+  if (err.code === 1) {
+    // Permission denied: tracking can't continue
+    if (state.status !== 'idle') stopWalk();
+    showToast('Location permission denied. Please allow location access and try again.', 4000);
+    return;
+  }
+  // Signal lost / timeout are usually temporary and the watch keeps retrying,
+  // so keep the walk going instead of ending it.
+  const now = Date.now();
+  if (now - lastGeoToast > 8000) {
+    lastGeoToast = now;
+    showToast(err.code === 2 ? 'GPS signal lost — still trying…' : 'Waiting for GPS…', 3000);
+  }
 }
 
 function updateAccuracyBadge(acc) {
@@ -453,18 +486,23 @@ function startWalk() {
   state.coords = [];
   state.totalDist = 0;
   state.lastPos = null;
+  state.newSegment = false;
   state.startTs = Date.now();
+  state.lastSpeedTs = state.startTs;
   state.pausedMs = 0;
   state.pauseStart = null;
   state.status = 'active';
   state.centered = false;
   clearRouteLine();
   clearReviewLine();
+  setSpeed(0);
 
   state.watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, GEO_OPTIONS);
 
   startTimer();
+  updateStats();
   renderButtons();
+  requestWakeLock();
   el('walk-label').textContent = 'Walk in progress';
   showToast('Walk started — acquiring GPS…');
 }
@@ -475,6 +513,10 @@ function pauseWalk() {
   state.pauseStart = Date.now();
   if (state.watchId !== null) { navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
   clearInterval(state.timerInterval); state.timerInterval = null;
+  updateStats();
+  setSpeed(0);
+  releaseWakeLock();
+  persistProgress();
   renderButtons();
   el('walk-label').textContent = 'Walk paused';
   showToast('Walk paused');
@@ -485,8 +527,14 @@ function resumeWalk() {
   state.pausedMs += Date.now() - state.pauseStart;
   state.pauseStart = null;
   state.status = 'active';
+  // Don't count distance travelled while paused: the next fix starts a new segment
+  state.lastPos = null;
+  state.newSegment = true;
+  state.lastSpeedTs = Date.now();
   state.watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, GEO_OPTIONS);
   startTimer();
+  requestWakeLock();
+  persistProgress();
   renderButtons();
   el('walk-label').textContent = 'Walk in progress';
   showToast('Walk resumed');
@@ -498,28 +546,42 @@ function stopWalk() {
   clearInterval(state.timerInterval); state.timerInterval = null;
 
   const elapsed = elapsedMs();
-  saveWalk({
-    id: Date.now(),
-    date: new Date().toISOString(),
-    coords: state.coords,
-    distM: state.totalDist,
-    durationMs: elapsed,
-  });
+  const dist = state.totalDist;
+  const worthSaving = state.coords.length >= 2 && dist > 0;
+  if (worthSaving) {
+    saveWalk({
+      id: Date.now(),
+      date: new Date().toISOString(),
+      coords: state.coords,
+      distM: dist,
+      durationMs: elapsed,
+    });
+  }
+
+  clearProgress();
+  releaseWakeLock();
+  updateStats();
+  setSpeed(0);
 
   state.status = 'idle';
   state.centered = false;
+  state.lastPos = null;
+  state.startTs = null;
+  state.pauseStart = null;
   renderButtons();
-  el('walk-label').textContent = 'Walk saved!';
+  el('walk-label').textContent = worthSaving ? 'Walk saved!' : 'Walk discarded';
   el('accuracy-badge').classList.remove('show');
-  showToast(`Walk saved — ${fmtDist(state.totalDist)} in ${fmtDuration(elapsed)}`);
+  showToast(worthSaving
+    ? `Walk saved — ${fmtDist(dist)} km in ${fmtDuration(elapsed)}`
+    : 'Walk too short to save');
 
-  // reset stats
+  // reset stats (unless a new walk has already started)
   setTimeout(() => {
+    if (state.status !== 'idle') return;
+    state.totalDist = 0;
     el('walk-label').textContent = 'Ready to walk';
-    el('stat-dist').innerHTML  = '0.00<span class="stat-unit">km</span>';
-    el('stat-time').textContent = '00:00';
-    el('stat-speed').innerHTML  = '0.0<span class="stat-unit">km/h</span>';
-    el('stat-avg').innerHTML    = '0.0<span class="stat-unit">km/h</span>';
+    updateStats();
+    setSpeed(0);
   }, 3000);
 }
 
@@ -529,16 +591,132 @@ function elapsedMs() {
   return Date.now() - state.startTs - state.pausedMs - extra;
 }
 
+function updateStats() {
+  const ms = elapsedMs();
+  el('stat-time').textContent = fmtDuration(ms);
+  el('stat-dist').innerHTML = `${fmtDist(state.totalDist)}<span class="stat-unit">km</span>`;
+  const avgKph = ms > 0 ? ((state.totalDist / 1000) / (ms / 3600000)) : 0;
+  el('stat-avg').innerHTML = `${avgKph.toFixed(1)}<span class="stat-unit">km/h</span>`;
+}
+
+function setSpeed(kph) {
+  el('stat-speed').innerHTML = `${kph.toFixed(1)}<span class="stat-unit">km/h</span>`;
+}
+
 function startTimer() {
   clearInterval(state.timerInterval);
   state.timerInterval = setInterval(() => {
-    const ms = elapsedMs();
-    el('stat-time').textContent = fmtDuration(ms);
-    el('stat-dist').innerHTML = `${fmtDist(state.totalDist)}<span class="stat-unit">km</span>`;
-    const avgKph = ms > 0 ? ((state.totalDist / 1000) / (ms / 3600000)) : 0;
-    el('stat-avg').innerHTML = `${avgKph.toFixed(1)}<span class="stat-unit">km/h</span>`;
+    updateStats();
+    // No fresh speed reading for a while (e.g. standing still): show 0
+    if (Date.now() - state.lastSpeedTs > 10000) setSpeed(0);
   }, 1000);
 }
+
+// ─────────────────────────── Route drawing ───────────────────────────
+// A walk's coords are drawn as separate segments, split wherever a point is
+// flagged `gap` (the first point after a pause), so pauses don't draw a line.
+function addRoutePoint(p) {
+  ensureRouteLine();
+  if (p.gap || !state.liveSegments.length) state.liveSegments.push([]);
+  state.liveSegments[state.liveSegments.length - 1].push([p.lat, p.lng]);
+  routeLine.setLatLngs(state.liveSegments);
+}
+
+function segmentsFromCoords(coords) {
+  const segs = [];
+  for (const c of coords) {
+    if (c.gap || !segs.length) segs.push([]);
+    segs[segs.length - 1].push([c.lat, c.lng]);
+  }
+  return segs;
+}
+
+// ─────────────────────────── In-progress walk backup ───────────────────────────
+// The active walk is saved to localStorage as it goes, so a reload, crash or
+// killed tab doesn't lose it. On next load it comes back paused.
+const PROGRESS_KEY = 'walkInProgress';
+let persistTimer = null;
+
+function persistProgress() {
+  clearTimeout(persistTimer); persistTimer = null;
+  if (state.status === 'idle') return;
+  try {
+    localStorage.setItem(PROGRESS_KEY, JSON.stringify({
+      status: state.status,
+      startTs: state.startTs,
+      pausedMs: state.pausedMs,
+      pauseStart: state.pauseStart,
+      totalDist: state.totalDist,
+      coords: state.coords,
+      savedAt: Date.now(),
+    }));
+  } catch { /* storage full or unavailable: carry on without a backup */ }
+}
+
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(persistProgress, 5000);
+}
+
+function clearProgress() {
+  clearTimeout(persistTimer); persistTimer = null;
+  try { localStorage.removeItem(PROGRESS_KEY); } catch {}
+}
+
+function restoreInProgress() {
+  let data;
+  try { data = JSON.parse(localStorage.getItem(PROGRESS_KEY)); } catch { return; }
+  if (!data || !data.startTs || !Array.isArray(data.coords) ||
+      !data.coords.every(c => c && Number.isFinite(c.lat) && Number.isFinite(c.lng))) return;
+
+  state.coords = data.coords;
+  state.totalDist = data.totalDist || 0;
+  state.startTs = data.startTs;
+  state.pausedMs = data.pausedMs || 0;
+  // Time between the last backup and now is not counted as walking time
+  state.pauseStart = (data.status === 'paused' && data.pauseStart) ? data.pauseStart : (data.savedAt || Date.now());
+  state.status = 'paused';
+  state.lastPos = null;
+  state.newSegment = true;
+
+  state.liveSegments = segmentsFromCoords(state.coords);
+  ensureRouteLine();
+  routeLine.setLatLngs(state.liveSegments);
+
+  updateStats();
+  renderButtons();
+  el('walk-label').textContent = 'Walk paused';
+  showToast('Unfinished walk restored. Resume or Stop & Save.', 4000);
+}
+
+// ─────────────────────────── Keep screen awake ───────────────────────────
+let wakeLock = null;
+let wakeLockWanted = false;   // true while a walk is active
+let wakeLockPending = false;  // a request is in flight
+
+async function requestWakeLock() {
+  wakeLockWanted = true;
+  if (!('wakeLock' in navigator) || wakeLock || wakeLockPending) return;
+  wakeLockPending = true;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    if (!wakeLockWanted) { lock.release().catch(() => {}); return; } // walk paused/stopped meanwhile
+    wakeLock = lock;
+    lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
+  } catch { /* not allowed (e.g. page hidden or low battery) */ }
+  finally { wakeLockPending = false; }
+}
+
+function releaseWakeLock() {
+  wakeLockWanted = false;
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') persistProgress();
+  else if (state.status === 'active') requestWakeLock(); // the browser drops the lock when hidden
+});
+window.addEventListener('pagehide', persistProgress);
 
 // ─────────────────────────── Buttons ───────────────────────────
 function renderButtons() {
@@ -641,7 +819,7 @@ function viewWalk(id) {
 
   clearReviewLine();
   if (walk.coords && walk.coords.length > 1) {
-    const latlngs = walk.coords.map(c => [c.lat, c.lng]);
+    const latlngs = segmentsFromCoords(walk.coords);
     reviewLine = L.polyline(latlngs, { color: '#EA4335', weight: 5, opacity: .85, lineJoin: 'round' }).addTo(map);
     map.fitBounds(reviewLine.getBounds(), { padding: [60, 60] });
   } else if (walk.coords && walk.coords.length === 1) {
@@ -712,6 +890,7 @@ function showToast(msg, duration = 2500) {
 
 // ─────────────────────────── Init ───────────────────────────
 renderButtons();
+restoreInProgress();
 
 // Try to get initial position for map centering (no tracking)
 if (navigator.geolocation) {
